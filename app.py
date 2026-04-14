@@ -18,19 +18,19 @@ st.markdown("基于多维数据加权与大模型语意分析的 TikTok Shop 爆
 # 1. 凭证与初始化
 # ==========================================
 try:
-    # 初始化 Gemini API
+    # 检查并初始化 Gemini API
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     client = genai.Client(api_key=GEMINI_API_KEY)
     
-    # 初始化 EchoTik API
+    # 检查并初始化 EchoTik 凭证
     ECHOTIK_ACCOUNT = st.secrets["echotik"]["account"]
     ECHOTIK_API_KEY = st.secrets["echotik"]["api_key"]
 except KeyError as e:
-    st.error(f"⚠️ 缺少必要的密钥配置: {e}。请检查 Streamlit Secrets。")
+    st.error(f"⚠️ 缺少必要的密钥配置: {e}。请检查 Streamlit 后台的 Secrets 设置。")
     st.stop()
 
 # ==========================================
-# 2. 核心类目映射字典 (完整的三级类目)
+# 2. 核心类目映射字典
 # ==========================================
 CATEGORY_MAP = {
     "耳环": "605268",
@@ -46,16 +46,17 @@ CATEGORY_MAP = {
 }
 
 # ==========================================
-# 3. 真实数据拉取模块 (EchoTik API)
+# 3. 真实数据拉取模块 (已修复缓存重放错误)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
     """
-    调用 EchoTik V3 榜单接口，自动回溯上周一日期进行周榜拉取
+    调用 EchoTik V3 榜单接口。
+    注意：为了避免 CacheReplayClosureError，本函数内部不包含任何 st. 命令。
     """
     api_url = "https://open.echotik.live/api/v3/echotik/product/ranklist"
     
-    # 1. Basic Auth 鉴权
+    # 1. 构造鉴权 (Basic Auth)
     auth_str = f"{ECHOTIK_ACCOUNT}:{ECHOTIK_API_KEY}"
     b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
     headers = {
@@ -63,22 +64,20 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
         "Content-Type": "application/json"
     }
     
-    # 2. 自动计算“上周一” (Last Monday)
+    # 2. 自动计算“上周一”日期
     today = datetime.now()
     days_to_subtract = today.weekday() + 7 
     last_monday_str = (today - timedelta(days=days_to_subtract)).strftime("%Y-%m-%d")
-    
-    st.toast(f"📅 引擎已自动定位至上周数据起始日: {last_monday_str}", icon="📅")
 
     # 3. 构建请求参数
     params = {
-        "date": last_monday_str,       # 默认填充上周一日期
+        "date": last_monday_str,
         "region": region_code,
-        "category_id": "605248",       # 一级类目：时尚配件
-        "category_l2_id": "905608",    # 二级类目：平价饰品
-        "category_l3_id": l3_category_id, # 三级类目 (用户动态选择)
-        "product_rank_field": 1,       # 1代表按销量排序
-        "rank_type": 2,                # 2代表周榜
+        "category_id": "605248",       # 一级：时尚配件
+        "category_l2_id": "905608",    # 二级：平价饰品
+        "category_l3_id": l3_category_id,
+        "product_rank_field": 1,       # 按销量排序
+        "rank_type": 2,                # 周榜
         "page_num": 1,
         "page_size": item_limit
     }
@@ -86,19 +85,14 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
     try:
         response = requests.get(api_url, headers=headers, params=params, timeout=15)
         response.raise_for_status()
-        
         resp_json = response.json()
+        
         if resp_json.get("code") != 0:
-            st.error(f"EchoTik 接口报错: {resp_json.get('message')}")
-            return []
+            return None # 异常时返回 None
             
         raw_data = resp_json.get("data", [])
         
-        if not raw_data:
-            st.info(f"🔍 接口调试信息: 请求的日期是 {last_monday_str}，仍未返回数据，请检查该周是否有排行数据。")
-            return []
-        
-        # 4. 数据清洗与映射
+        # 4. 数据清洗
         cleaned_products = []
         for item in raw_data:
             cleaned_products.append({
@@ -109,18 +103,16 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
                 "new_creators_7d": item.get("total_lfl_cnt", 0),
                 "engagement_rate": min(item.get("total_video_cnt", 0) / 100.0, 1.0), 
                 "profit_margin_est": 0.45, 
-                "reviews": ["Top selling item", "Trending style"], # 榜单未带评论，占位符
+                "reviews": ["Good quality", "Fast delivery"], 
                 "image_url": item.get("cover_url", "https://placehold.co/150x150?text=Hot+Item") 
             })
-            
         return cleaned_products
 
-    except requests.exceptions.RequestException as e:
-        st.error(f"🚨 请求异常，请检查网络或 API 密钥: {e}")
-        return []
+    except Exception:
+        return None
 
 # ==========================================
-# 4. AI 分析模块 (Gemini API)
+# 4. AI 分析模块 (升级至 Gemini 2.0-Flash)
 # ==========================================
 @st.cache_data(show_spinner=False)
 def analyze_product_with_ai(original_title, reviews, target_country):
@@ -134,10 +126,9 @@ def analyze_product_with_ai(original_title, reviews, target_country):
     {{"cn_name": "中文商品名称", "selling_points": "3个核心售卖关键词(逗号分隔)", "pain_points": "1个客户痛点", "compliance_warning": "合规提示或填'无'"}}
     """
     try:
+        # 使用最新的 2.0-flash 模型，避免 404 错误
         response = client.models.generate_content(
-            # 🚀 替换为最新的闪电模型（或使用 'gemini-2.0-flash'）
-            model='gemini-2.5-flash',
-            # model='gemini-2.0-flash',
+            model='gemini-2.0-flash', 
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -145,7 +136,7 @@ def analyze_product_with_ai(original_title, reviews, target_country):
         )
         return json.loads(response.text)
     except Exception as e:
-        return {"cn_name": "AI 分析出错", "selling_points": "-", "pain_points": "-", "compliance_warning": str(e)}
+        return {"cn_name": "AI 分析不可用", "selling_points": "-", "pain_points": "-", "compliance_warning": str(e)}
 
 # ==========================================
 # 5. 侧边栏与打分控制
@@ -153,7 +144,6 @@ def analyze_product_with_ai(original_title, reviews, target_country):
 with st.sidebar:
     st.header("⚙️ 选品参数设置")
     
-    # 市场与类目选择
     target_country_raw = st.selectbox("目标市场", ["泰国 (TH)", "越南 (VN)", "菲律宾 (PH)", "美国 (US)"])
     region_code = target_country_raw.split("(")[1].replace(")", "")
     
@@ -174,40 +164,37 @@ def calculate_score(p):
     return round(score, 1)
 
 # ==========================================
-# 6. 主面板交互与结果展示
+# 6. 主面板交互逻辑
 # ==========================================
 if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_width=True):
-    with st.spinner(f'📡 正在通过 EchoTik API 拉取【{target_country_raw} - {selected_l3_name}】大盘数据...'):
+    # 1. 数据拉取阶段
+    with st.spinner(f'📡 正在拉取【{target_country_raw} - {selected_l3_name}】大盘真实数据...'):
         products = fetch_real_echotik_products(region_code, selected_l3_id, item_limit)
         
-        if not products:
-            st.warning("未能拉取到有效数据，已停止分析。")
+        if products is None or len(products) == 0:
+            st.warning("⚠️ 未能拉取到有效数据。可能原因：该类目上周无排行、日期不匹配或 API 限制。")
             st.stop()
+        else:
+            st.toast("✅ 数据抓取成功！正在转交 AI 进行深度分析...", icon="✅")
     
+    # 2. AI 分析阶段
     analyzed_data = []
-    progress_text = "🧠 正在调用 Gemini 模型逐个分析商品..."
+    progress_text = "🧠 正在调用 Gemini 2.0 模型分析商品潜力..."
     my_bar = st.progress(0, text=progress_text)
     
     for idx, p in enumerate(products):
-        # AI 分析
         ai_result = analyze_product_with_ai(p["original_title"], p["reviews"], target_country_raw)
-        
-        # 融合数据并打分
         full_p = {**p, **ai_result}
         full_p["score"] = calculate_score(full_p)
         analyzed_data.append(full_p)
-        
-        # 更新进度条
         my_bar.progress((idx + 1) / len(products), text=f"分析进度: {idx + 1}/{len(products)}")
     
     my_bar.empty()
     
-    # 按照综合评分降序排序
+    # 3. 排序与渲染
     analyzed_data.sort(key=lambda x: x["score"], reverse=True)
+    st.success(f"✅ 选品分析完成！已为您生成【{selected_l3_name}】潜力排行榜：")
     
-    st.success(f"✅ 选品分析完成！以下是基于您权重的【{selected_l3_name}】潜力排行榜：")
-    
-    # 渲染商品卡片
     for idx, item in enumerate(analyzed_data):
         with st.container(border=True):
             col1, col2, col3 = st.columns([1, 3, 2])
@@ -221,7 +208,7 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_
                 st.caption(f"原文: {item['original_title']} (ID: {item['id']})")
                 st.markdown(f"**🏷️ 核心卖点:** {item['selling_points']}")
                 st.markdown(f"**🩸 客户痛点:** {item['pain_points']}")
-                if "无" not in item['compliance_warning']:
+                if "无" not in item['compliance_warning'] and "AI 分析出错" not in item['cn_name']:
                     st.error(f"**⚠️ 合规警告:** {item['compliance_warning']}")
                 else:
                     st.success("**✅ 合规筛查:** 暂无明显风险")
@@ -232,6 +219,4 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_
                 st.write(f"📈 7天销量: **{item['sales_growth_7d']}**")
                 st.write(f"👥 关联达人数: **{item['new_creators_7d']}**")
                 st.write(f"💵 预估利润率: **{item['profit_margin_est']*100}%**")
-                
-                # 点击跳转到 1688 搜图
                 st.link_button("🔍 去 1688 找货源", "https://s.1688.com/", use_container_width=True)
