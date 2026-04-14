@@ -130,7 +130,8 @@ def analyze_product_with_ai(original_title, reviews, target_country):
             # 使用最新的 2.0-flash 模型，避免 404 错误
             # model='gemini-2.0-flash', 
             # 退回 1.5 版本，免费额度最稳
-            model='gemini-1.5-flash',
+            # model='gemini-1.5-flash',
+            model='gemini-1.5-flash-8b',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
