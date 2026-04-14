@@ -135,7 +135,9 @@ def analyze_product_with_ai(original_title, reviews, target_country):
     """
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            # 🚀 替换为最新的闪电模型（或使用 'gemini-2.0-flash'）
+            model='gemini-2.5-flash',
+            # model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
