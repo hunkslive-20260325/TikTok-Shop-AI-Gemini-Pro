@@ -3,6 +3,7 @@ import json
 import time
 import base64
 import requests
+import urllib.parse
 from datetime import datetime, timedelta
 
 # ==========================================
@@ -16,10 +17,7 @@ st.markdown("基于多维数据加权与大模型语意分析的 TikTok Shop 爆
 # 1. 凭证与初始化
 # ==========================================
 try:
-    # 加载 OpenRouter API Key
     OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
-    
-    # 检查并初始化 EchoTik 凭证
     ECHOTIK_ACCOUNT = st.secrets["echotik"]["account"]
     ECHOTIK_API_KEY = st.secrets["echotik"]["api_key"]
 except KeyError as e:
@@ -30,20 +28,14 @@ except KeyError as e:
 # 2. 核心类目映射字典
 # ==========================================
 CATEGORY_MAP = {
-    "耳环": "605268",
-    "脚链": "605272",
-    "戒指": "605273",
-    "手环与手链": "605274",
-    "项链": "605280",
-    "首饰吊件及装饰": "907400",
-    "身体饰品": "907528",
-    "钥匙扣": "907656",
-    "首饰套装": "907784",
+    "耳环": "605268", "脚链": "605272", "戒指": "605273", 
+    "手环与手链": "605274", "项链": "605280", "首饰吊件及装饰": "907400",
+    "身体饰品": "907528", "钥匙扣": "907656", "首饰套装": "907784", 
     "珠宝调节保护工具": "995080"
 }
 
 # ==========================================
-# 3. 真实数据拉取模块 (纯净版)
+# 3. 真实数据拉取模块 
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
@@ -92,42 +84,36 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
                 "new_creators_7d": item.get("total_lfl_cnt", 0),
                 "engagement_rate": min(item.get("total_video_cnt", 0) / 100.0, 1.0), 
                 "profit_margin_est": 0.45, 
-                "reviews": ["Top Rated", "High Demand"], 
-                "image_url": item.get("cover_url", "https://placehold.co/150x150?text=Hot+Item") 
+                "reviews": ["Trending product"], 
+                # 榜单不带图，依然用占位，但我们在UI里提供直达链接
+                "image_url": "https://placehold.co/150x150/f0f2f6/8b8d94?text=No+Image\\nSee+Link" 
             })
         return cleaned_products
-
     except Exception:
         return None
 
 # ==========================================
-# 4. AI 分析模块 (接入 OpenRouter 平台)
+# 4. AI 分析模块 (强化 JSON 解析防错机制)
 # ==========================================
 @st.cache_data(show_spinner=False)
 def analyze_product_with_ai(original_title, reviews, target_country):
     prompt = f"""
     你是一个专业的 TikTok Shop (国家：{target_country}) 跨境电商选品专家。
-    请分析以下商品信息：
-    - 商品原名：{original_title}
-    - 客户评价片段：{', '.join(reviews)}
-
+    请分析以下商品：
+    - 原名：{original_title}
+    
     请以严格的 JSON 格式输出，包含以下字段：
-    {{"cn_name": "中文商品名称", "selling_points": "3个核心售卖关键词(逗号分隔)", "pain_points": "1个客户痛点", "compliance_warning": "合规提示或填'无'"}}
+    {{"cn_name": "中文商品名称", "selling_points": "3个核心售卖关键词(逗号分隔)", "pain_points": "1个可能的客户痛点", "compliance_warning": "合规风险提示或填'无'"}}
     """
     
-    # 构造 OpenRouter 的请求头和请求体
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        # 下面这两个可选头可以让 OpenRouter 识别你的应用来源
-        "HTTP-Referer": "https://tiktok-shop-ai-gemini-pro.streamlit.app/",
-        "X-Title": "AI 跨境饰品选品引擎"
+        "Content-Type": "application/json"
     }
     
     payload = {
         "model": "google/gemini-2.0-flash-001",
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"} # 强制返回 JSON 格式
+        "messages": [{"role": "user", "content": prompt}]
     }
 
     try:
@@ -139,26 +125,36 @@ def analyze_product_with_ai(original_title, reviews, target_country):
         )
         response.raise_for_status()
         
-        # 解析 OpenRouter 标准的 OpenAI 格式响应
-        result_text = response.json()["choices"][0]["message"]["content"]
-        return json.loads(result_text)
+        resp_data = response.json()
+        if "error" in resp_data:
+            return {"cn_name": "AI 分析出错", "selling_points": "-", "pain_points": "-", "compliance_warning": f"OpenRouter报错: {resp_data['error']['message']}"}
+
+        result_text = resp_data["choices"][0]["message"]["content"]
+        
+        # 🧹 核心修复：强力清洗 Markdown 符号，防止 json.loads 崩溃
+        result_text = result_text.strip()
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+            
+        return json.loads(result_text.strip())
         
     except Exception as e:
-        return {"cn_name": "AI 分析出错", "selling_points": "-", "pain_points": "-", "compliance_warning": f"接口异常: {str(e)}"}
+        return {"cn_name": "AI 分析出错", "selling_points": "-", "pain_points": "-", "compliance_warning": f"代码执行异常: {str(e)}"}
 
 # ==========================================
 # 5. 侧边栏与打分控制
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 选品参数设置")
-    
     target_country_raw = st.selectbox("目标市场", ["泰国 (TH)", "越南 (VN)", "菲律宾 (PH)", "美国 (US)"])
     region_code = target_country_raw.split("(")[1].replace(")", "")
     
     selected_l3_name = st.selectbox("细分类目", list(CATEGORY_MAP.keys()))
     selected_l3_id = CATEGORY_MAP[selected_l3_name]
     
-    item_limit = st.select_slider("拉取商品数量", options=[5, 10, 20, 30], value=10)
+    item_limit = st.select_slider("拉取商品数量", options=[5, 10, 20, 30], value=5)
     
     st.markdown("---")
     st.header("🧮 潜力打分权重设置")
@@ -195,12 +191,10 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_
         analyzed_data.append(full_p)
         my_bar.progress((idx + 1) / len(products), text=f"分析进度: {idx + 1}/{len(products)}")
         
-        # 🚀 既然付费了，刹车时间从 4 秒降到 0.5 秒！（留 0.5 秒防止并发把自己的服务器卡死）
         if idx < len(products) - 1:
-            time.sleep(0.5)
+            time.sleep(0.5) # 付费通道，0.5秒极速并发
     
     my_bar.empty()
-    
     analyzed_data.sort(key=lambda x: x["score"], reverse=True)
     st.success(f"✅ 选品分析完成！已为您生成【{selected_l3_name}】潜力排行榜：")
     
@@ -215,17 +209,28 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_
             with col2:
                 st.subheader(f"Top {idx+1}: {item['cn_name']}")
                 st.caption(f"原文: {item['original_title']} (ID: {item['id']})")
-                st.markdown(f"**🏷️ 核心卖点:** {item['selling_points']}")
-                st.markdown(f"**🩸 客户痛点:** {item['pain_points']}")
-                if "无" not in item['compliance_warning'] and "AI 分析出错" not in item['cn_name']:
-                    st.error(f"**⚠️ 合规警告:** {item['compliance_warning']}")
+                
+                # 修复了错误遮蔽问题：如果报错，直接用红框显示原因
+                if "AI 分析出错" in item['cn_name']:
+                    st.error(f"**⚠️ AI 解析失败:** {item['compliance_warning']}")
                 else:
-                    st.success("**✅ 合规筛查:** 暂无明显风险")
+                    st.markdown(f"**🏷️ 核心卖点:** {item['selling_points']}")
+                    st.markdown(f"**🩸 客户痛点:** {item['pain_points']}")
+                    if "无" not in item['compliance_warning']:
+                        st.warning(f"**⚠️ 合规警告:** {item['compliance_warning']}")
+                    else:
+                        st.success("**✅ 合规筛查:** 暂无明显风险")
             
             with col3:
                 st.markdown("📊 **数据表现**")
                 st.write(f"💰 均价: **{item['price_local']}** (当地货币)")
                 st.write(f"📈 7天销量: **{item['sales_growth_7d']}**")
                 st.write(f"👥 关联达人数: **{item['new_creators_7d']}**")
-                st.write(f"💵 预估利润率: **{item['profit_margin_est']*100}%**")
-                st.link_button("🔍 去 1688 找货源", "https://s.1688.com/", use_container_width=True)
+                
+                # 🔗 按钮 1：跳往 EchoTik 详情页（看主图、看走势）
+                echotik_url = f"https://echotik.live/products/{item['id']}"
+                st.link_button("🔗 查看 EchoTik 原商品 (含图片)", echotik_url, use_container_width=True)
+                
+                # 🔍 按钮 2：自动将 AI 翻译的中文名带入 1688 搜索
+                search_keyword = urllib.parse.quote(item['cn_name'] if "AI 分析出错" not in item['cn_name'] else item['original_title'])
+                st.link_button("🛒 去 1688 自动搜同款", f"https://s.1688.com/selloffer/offer_search.htm?keywords={search_keyword}", use_container_width=True)
