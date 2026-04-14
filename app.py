@@ -79,7 +79,7 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
         "product_rank_field": 1,       # 按销量排序
         "rank_type": 2,                # 周榜
         "page_num": 1,
-        "page_size": item_limit
+        "page_size": 1
     }
 
     try:
@@ -126,9 +126,11 @@ def analyze_product_with_ai(original_title, reviews, target_country):
     {{"cn_name": "中文商品名称", "selling_points": "3个核心售卖关键词(逗号分隔)", "pain_points": "1个客户痛点", "compliance_warning": "合规提示或填'无'"}}
     """
     try:
-        # 使用最新的 2.0-flash 模型，避免 404 错误
         response = client.models.generate_content(
-            model='gemini-2.0-flash', 
+            # 使用最新的 2.0-flash 模型，避免 404 错误
+            # model='gemini-2.0-flash', 
+            # 退回 1.5 版本，免费额度最稳
+            model='gemini-1.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -188,7 +190,11 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_
         full_p["score"] = calculate_score(full_p)
         analyzed_data.append(full_p)
         my_bar.progress((idx + 1) / len(products), text=f"分析进度: {idx + 1}/{len(products)}")
-    
+
+        # 🚦 核心修复：每次分析完停顿 4 秒，完美绕过免费版 API 的并发限制
+        if idx < len(products) - 1:
+            time.sleep(4)
+            
     my_bar.empty()
     
     # 3. 排序与渲染
