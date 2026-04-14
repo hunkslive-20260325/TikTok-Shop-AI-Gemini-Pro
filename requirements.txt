@@ -1,4 +1,4 @@
 streamlit
 requests
 pandas
-google-generativeai
+google-genai
