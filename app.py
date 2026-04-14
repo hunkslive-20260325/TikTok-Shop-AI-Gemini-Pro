@@ -51,25 +51,28 @@ CATEGORY_MAP = {
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
     """
-    调用 EchoTik V3 榜单接口，拉取真实爆款数据
+    调用 EchoTik V3 榜单接口，自动回溯上周一日期进行周榜拉取
     """
     api_url = "https://open.echotik.live/api/v3/echotik/product/ranklist"
     
-    # Basic Auth Base64 加密
+    # 1. Basic Auth 鉴权
     auth_str = f"{ECHOTIK_ACCOUNT}:{ECHOTIK_API_KEY}"
     b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
-    
     headers = {
         "Authorization": f"Basic {b64_auth}",
         "Content-Type": "application/json"
     }
     
-    # 获取昨天的数据
-    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # 2. 自动计算“上周一” (Last Monday)
+    today = datetime.now()
+    days_to_subtract = today.weekday() + 7 
+    last_monday_str = (today - timedelta(days=days_to_subtract)).strftime("%Y-%m-%d")
     
-    # 请求参数
+    st.toast(f"📅 引擎已自动定位至上周数据起始日: {last_monday_str}", icon="📅")
+
+    # 3. 构建请求参数
     params = {
-        "date": yesterday_str,
+        "date": last_monday_str,       # 默认填充上周一日期
         "region": region_code,
         "category_id": "605248",       # 一级类目：时尚配件
         "category_l2_id": "905608",    # 二级类目：平价饰品
@@ -91,7 +94,11 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
             
         raw_data = resp_json.get("data", [])
         
-        # 数据清洗与映射
+        if not raw_data:
+            st.info(f"🔍 接口调试信息: 请求的日期是 {last_monday_str}，仍未返回数据，请检查该周是否有排行数据。")
+            return []
+        
+        # 4. 数据清洗与映射
         cleaned_products = []
         for item in raw_data:
             cleaned_products.append({
@@ -100,10 +107,10 @@ def fetch_real_echotik_products(region_code, l3_category_id, item_limit):
                 "price_local": item.get("spu_avg_price", 0),
                 "sales_growth_7d": item.get("total_sale_cnt", 0),
                 "new_creators_7d": item.get("total_lfl_cnt", 0),
-                "engagement_rate": min(item.get("total_video_cnt", 0) / 100.0, 1.0), # 模拟互动率
-                "profit_margin_est": 0.45, # 默认预估利润率
-                "reviews": ["Good quality", "Fast shipping", "Looks beautiful"], # 暂无评论接口，用模拟数据
-                "image_url": item.get("cover_url", "https://placehold.co/150?text=No+Image") 
+                "engagement_rate": min(item.get("total_video_cnt", 0) / 100.0, 1.0), 
+                "profit_margin_est": 0.45, 
+                "reviews": ["Top selling item", "Trending style"], # 榜单未带评论，占位符
+                "image_url": item.get("cover_url", "https://placehold.co/150x150?text=Hot+Item") 
             })
             
         return cleaned_products
@@ -146,7 +153,7 @@ with st.sidebar:
     
     # 市场与类目选择
     target_country_raw = st.selectbox("目标市场", ["泰国 (TH)", "越南 (VN)", "菲律宾 (PH)", "美国 (US)"])
-    region_code = target_country_raw.split("(")[1].replace(")", "") # 提取 TH, VN 等简写
+    region_code = target_country_raw.split("(")[1].replace(")", "")
     
     selected_l3_name = st.selectbox("细分类目", list(CATEGORY_MAP.keys()))
     selected_l3_id = CATEGORY_MAP[selected_l3_name]
@@ -167,12 +174,12 @@ def calculate_score(p):
 # ==========================================
 # 6. 主面板交互与结果展示
 # ==========================================
-if st.button("🚀 开始 AI 智能选品引擎", type="primary", width="stretch"):
+if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_width=True):
     with st.spinner(f'📡 正在通过 EchoTik API 拉取【{target_country_raw} - {selected_l3_name}】大盘数据...'):
         products = fetch_real_echotik_products(region_code, selected_l3_id, item_limit)
         
         if not products:
-            st.warning("暂未拉取到该类目的数据，请尝试更换国家或类目。")
+            st.warning("未能拉取到有效数据，已停止分析。")
             st.stop()
     
     analyzed_data = []
@@ -204,7 +211,7 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", width="stretch
             col1, col2, col3 = st.columns([1, 3, 2])
             
             with col1:
-                st.image(item["image_url"], width="stretch")
+                st.image(item["image_url"], use_container_width=True)
                 st.metric(label="🏆 综合潜力分", value=item["score"])
                 
             with col2:
@@ -224,5 +231,5 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", width="stretch
                 st.write(f"👥 关联达人数: **{item['new_creators_7d']}**")
                 st.write(f"💵 预估利润率: **{item['profit_margin_est']*100}%**")
                 
-                # 点击跳转到 1688 搜图 (后续可换成调 API 自动搜图)
+                # 点击跳转到 1688 搜图
                 st.link_button("🔍 去 1688 找货源", "https://s.1688.com/", use_container_width=True)
