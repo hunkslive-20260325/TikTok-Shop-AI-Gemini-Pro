@@ -7,11 +7,24 @@ import urllib.parse
 from datetime import datetime, timedelta
 
 # ==========================================
-# 0. 页面基本配置
+# 0. 页面基本配置与全局状态
 # ==========================================
-st.set_page_config(page_title="AI 跨境饰品选品引擎", page_icon="💎", layout="wide")
-st.title("💎 跨境平价饰品 AI 智能选品引擎 (全能升级版)")
+st.set_page_config(page_title="平价饰品 AI 选品引擎", page_icon="💎", layout="wide")
+st.title("💎 平价饰品 AI 选品引擎")
 st.markdown("基于多维数据加权与 90 天趋势预测的 TikTok Shop 深度选品工具")
+
+# 初始化日志状态
+if "app_logs" not in st.session_state:
+    st.session_state.app_logs = []
+
+def add_log(title, request_data, response_data):
+    """添加调试日志的辅助函数"""
+    time_str = datetime.now().strftime("%H:%M:%S")
+    # 为了防止界面卡顿，如果是超长响应只截取前 300 个字符
+    res_str = str(response_data)
+    if len(res_str) > 300: res_str = res_str[:300] + " ... (已省略过长内容)"
+    log_content = f"[{time_str}] {title}\n👉 入参: {request_data}\n👈 返参: {res_str}"
+    st.session_state.app_logs.insert(0, log_content) # 插在最前面
 
 # ==========================================
 # 1. 凭证与初始化
@@ -25,7 +38,7 @@ except KeyError as e:
     st.stop()
 
 # ==========================================
-# 2. 常量配置 (汇率、类目、市场)
+# 2. 常量配置
 # ==========================================
 CATEGORY_MAP = {
     "耳环": "605268", "脚链": "605272", "戒指": "605273", 
@@ -47,7 +60,6 @@ MARKET_CONFIG = {
 # ==========================================
 # 3. 数据拉取核心函数
 # ==========================================
-
 def get_auth_headers():
     auth_str = f"{ECHOTIK_ACCOUNT}:{ECHOTIK_API_KEY}"
     b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
@@ -55,18 +67,14 @@ def get_auth_headers():
 
 @st.cache_data(ttl=3600)
 def fetch_products(region, l3_id, rank_type, limit):
-    """
-    1. 获取榜单基础数据
-    """
     api_url = "https://open.echotik.live/api/v3/echotik/product/ranklist"
     today = datetime.now()
     
-    # 周期日期计算逻辑
-    if rank_type == 1: # 日榜
+    if rank_type == 1:
         target_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    elif rank_type == 2: # 周榜
+    elif rank_type == 2:
         target_date = (today - timedelta(days=today.weekday() + 7)).strftime("%Y-%m-%d")
-    else: # 月榜
+    else:
         target_date = today.replace(day=1).strftime("%Y-%m-%d")
 
     params = {
@@ -75,15 +83,17 @@ def fetch_products(region, l3_id, rank_type, limit):
         "product_rank_field": 1, "rank_type": rank_type,
         "page_num": 1, "page_size": limit
     }
-    
     try:
         res = requests.get(api_url, headers=get_auth_headers(), params=params, timeout=15).json()
+        add_log("📊 大盘商品拉取", params, f"成功获取 {len(res.get('data', []))} 条数据" if res.get("code")==0 else res)
         return res.get("data", [])
-    except: return []
+    except Exception as e:
+        add_log("❌ 大盘拉取异常", params, str(e))
+        return []
 
-def fetch_potential_index(product_id):
+def fetch_potential_index(product_id, rank_type):
     """
-    2. 获取近90天趋势并判断潜力
+    根据筛选周期，动态计算未来趋势
     """
     api_url = "https://open.echotik.live/api/v3/echotik/product/trend"
     end_date = datetime.now().strftime("%Y-%m-%d")
@@ -92,45 +102,72 @@ def fetch_potential_index(product_id):
     params = {"product_id": product_id, "start_date": start_date, "end_date": end_date}
     try:
         res = requests.get(api_url, headers=get_auth_headers(), params=params, timeout=10).json()
+        
+        if res.get("code") != 0:
+            add_log("❌ 趋势接口报错", params, res)
+            return "计算失败 (接口拒绝)", 0
+            
         trends = res.get("data", [])
-        if len(trends) < 2: return "数据不足", 0
+        if len(trends) < 14: # 数据量太少无法测算
+            return "新商品/数据不足", 0
+            
+        # 提取日销量增量，排倒序（最新的在前）
+        daily_sales = [t.get("total_sale_1d_cnt") or 0 for t in trends]
+        daily_sales.reverse()
         
-        # 简单算法：最近10天销量均值 vs 前80天均值
-        recent = sum(t.get("total_sale_cnt", 0) for t in trends[:10]) / 10
-        history = sum(t.get("total_sale_cnt", 0) for t in trends[10:]) / (len(trends)-10)
+        # 动态趋势算法
+        if rank_type == 1: # 日榜：对比近3天均值 与 往前推7天均值
+            recent_avg = sum(daily_sales[:3]) / 3
+            history_avg = sum(daily_sales[3:10]) / 7
+        elif rank_type == 2: # 周榜：对比近7天均值 与 往前推21天均值
+            recent_avg = sum(daily_sales[:7]) / 7
+            history_avg = sum(daily_sales[7:28]) / 21 if len(daily_sales) >= 28 else 1
+        else: # 月榜：对比近30天均值 与 往前推60天均值
+            recent_avg = sum(daily_sales[:30]) / 30
+            history_avg = sum(daily_sales[30:90]) / 60 if len(daily_sales) >= 90 else 1
+            
+        # 避免除以 0
+        history_avg = max(history_avg, 0.1)
+        ratio = recent_avg / history_avg
         
-        if recent > history * 1.2: return "🔥 显著上升", recent
-        elif recent < history * 0.8: return "📉 正在下降", recent
-        else: return "➡️ 趋势平稳", recent
-    except: return "计算失败", 0
+        add_log(f"📈 趋势测算 ({product_id})", f"周期:{rank_type}, 最近均值:{recent_avg:.1f}, 历史均值:{history_avg:.1f}", f"比值: {ratio:.2f}")
+
+        if ratio > 1.25: return f"🔥 显著上升 (增速 {int((ratio-1)*100)}%)", recent_avg
+        elif ratio < 0.8: return f"📉 正在下降 (跌幅 {int((1-ratio)*100)}%)", recent_avg
+        else: return "➡️ 趋势平稳", recent_avg
+        
+    except Exception as e:
+        add_log("❌ 趋势计算异常", params, str(e))
+        return "计算失败 (代码异常)", 0
 
 def fetch_product_videos(product_id):
-    """
-    3. 获取关联视频列表
-    """
     api_url = "https://open.echotik.live/api/v3/echotik/product/video"
-    params = {"product_id": product_id, "page_size": 3} # 只取前3个做参考
+    params = {"product_id": product_id, "page_size": 3} 
     try:
         res = requests.get(api_url, headers=get_auth_headers(), params=params, timeout=10).json()
         return res.get("data", [])
     except: return []
 
 # ==========================================
-# 4. AI 分析模块 (OpenRouter)
+# 4. AI 分析模块 (加入日志)
 # ==========================================
 def analyze_with_ai(title, region):
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    prompt = f"分析TikTok商品：{title}。市场：{region}。以JSON输出：cn_name(中文名), selling_points(3个核心卖点,逗号分隔的纯文本), pain_points(1个痛点,纯文本)。"
     payload = {
         "model": "google/gemini-2.0-flash-001",
-        "messages": [{"role": "user", "content": f"分析TikTok商品：{title}。市场：{region}。以JSON输出：cn_name(中文名), selling_points(3个卖点), pain_points(1个痛点)。"}]
+        "messages": [{"role": "user", "content": prompt}]
     }
     try:
         res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=20).json()
         content = res["choices"][0]["message"]["content"]
-        # 清洗 Markdown
+        
+        add_log(f"🧠 AI解析 ({title[:10]}...)", prompt, content)
+        
         clean_json = content.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
-    except:
+    except Exception as e:
+        add_log("❌ AI解析异常", prompt, str(e))
         return {"cn_name": "解析失败", "selling_points": "-", "pain_points": "-"}
 
 # ==========================================
@@ -148,69 +185,87 @@ with st.sidebar:
     l3_id = CATEGORY_MAP[l3_name]
     
     limit = st.select_slider("拉取数量", options=[5, 10, 15], value=5)
+    
+    st.markdown("---")
+    st.header("📝 系统运行日志")
+    if st.button("🗑️ 清空日志"):
+        st.session_state.app_logs = []
+        
+    with st.expander("点击查看 API 调试日志", expanded=False):
+        if st.session_state.app_logs:
+            for log in st.session_state.app_logs[:20]: # 仅显示最新20条
+                st.text(log)
+                st.markdown("---")
+        else:
+            st.caption("暂无运行记录...")
 
 # ==========================================
 # 6. 主逻辑渲染
 # ==========================================
-if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_width=True):
+if st.button("🚀 开始 AI 智能选品", type="primary", use_container_width=True):
     raw_products = fetch_products(m_info["code"], l3_id, rank_type, limit)
     
     if not raw_products:
-        st.warning("未能拉取到数据，请更换周期或市场尝试。")
+        st.warning("未能拉取到数据，请查看左侧日志排查具体原因。")
         st.stop()
 
     for idx, p in enumerate(raw_products):
         p_id = p.get("product_id")
         
-        # 深度数据获取
-        with st.status(f"正在深度分析第 {idx+1} 个商品: {p.get('product_name')[:20]}...", expanded=False):
+        with st.status(f"正在深度分析第 {idx+1} 个商品...", expanded=False):
             ai_res = analyze_with_ai(p.get("product_name"), market_label)
-            p_trend, recent_avg = fetch_potential_index(p_id)
+            p_trend, recent_avg = fetch_potential_index(p_id, rank_type)
             videos = fetch_product_videos(p_id)
             time.sleep(0.5)
 
-        # 渲染卡片 (无图片布局)
+        # 清洗展示瑕疵 (把列表转为字符串)
+        sp_display = ai_res.get('selling_points', '-')
+        if isinstance(sp_display, list): sp_display = ", ".join([str(x) for x in sp_display])
+
         with st.container(border=True):
             col1, col2 = st.columns([3, 2])
             
             with col1:
-                st.subheader(f"Top {idx+1}: {ai_res['cn_name']}")
+                st.subheader(f"Top {idx+1}: {ai_res.get('cn_name', '解析失败')}")
                 st.caption(f"原始名称: {p.get('product_name')} (ID: {p_id})")
-                st.write(f"🏷️ **核心卖点**: {ai_res['selling_points']}")
-                st.write(f"🩸 **客户痛点**: {ai_res['pain_points']}")
+                st.write(f"🏷️ **核心卖点**: {sp_display}")
+                st.write(f"🩸 **客户痛点**: {ai_res.get('pain_points', '-')}")
                 
-                # 潜力指数展示
-                st.info(f"🔮 **潜力预测 (90天)**: {p_trend}")
+                # 动态潜力指数展示
+                if "上升" in p_trend:
+                    st.success(f"🔮 **动态潜力预测 (依据选定周期)**: {p_trend}")
+                elif "下降" in p_trend:
+                    st.error(f"🔮 **动态潜力预测 (依据选定周期)**: {p_trend}")
+                else:
+                    st.info(f"🔮 **动态潜力预测 (依据选定周期)**: {p_trend}")
             
             with col2:
                 st.markdown("📊 **核心数据 (EchoTik USD 转换)**")
                 local_price = round(p.get("spu_avg_price", 0) * m_info["rate"], 2)
                 st.write(f"💰 均价: **{local_price} {m_info['sym']}** (参考: ${p.get('spu_avg_price')} USD)")
-                st.write(f"📈 周期销量: **{p.get('total_sale_cnt')}**")
-                st.write(f"👥 关联达人数: **{p.get('total_lfl_cnt')}**")
-                st.write(f"🎥 关联视频数: **{p.get('total_video_cnt')}**")
+                st.write(f"📈 周期销量: **{p.get('total_sale_cnt', 0)}**")
                 
-                # 视频列表链接展示
+                # 修复 None 的问题
+                lfl_cnt = p.get('total_lfl_cnt') or 0
+                st.write(f"👥 关联达人数: **{lfl_cnt}**")
+                
+                v_cnt = p.get('total_video_cnt') or 0
+                st.write(f"🎥 关联视频数: **{v_cnt}**")
+                
                 if videos:
-                    with st.expander("查看关联带货视频链接"):
+                    with st.expander("👉 查看关联带货视频素材"):
                         for v in videos:
-                            st.markdown(f"- [点击查看视频素材]({v.get('video_url', '#')}) (播放: {v.get('total_view_cnt', 0)})")
+                            st.markdown(f"- [去 TikTok 播放]({v.get('video_url', '#')}) (播放量: {v.get('total_view_cnt', 0)})")
                 else:
-                    st.caption("暂无视频链接数据")
+                    st.caption("EchoTik 暂未收录相关视频")
 
-            # 底部操作栏
             btn_col1, btn_col2 = st.columns(2)
             with btn_col1:
-                echotik_url = f"https://echotik.live/products/{p_id}"
-                st.link_button("🔗 在 EchoTik 查看详情(含图)", echotik_url, use_container_width=True)
-            
+                st.link_button("🔗 在 EchoTik 查看详情", f"https://echotik.live/products/{p_id}", use_container_width=True)
             with btn_col2:
-                # 1688 乱码修复逻辑
-                # 使用 utf-8 编码关键词。如果 1688 仍然显示乱码，尝试更换搜索入口
-                kw = ai_res['cn_name'] if ai_res['cn_name'] != "解析失败" else p.get('product_name')
+                kw = ai_res.get('cn_name', '') if ai_res.get('cn_name') != "解析失败" else p.get('product_name')
                 try:
                     encoded_kw = urllib.parse.quote(kw.encode('gbk'))
                 except:
-                    encoded_kw = urllib.parse.quote(kw) # 兜底防报错
-                search_1688 = f"https://s.1688.com/selloffer/offer_search.htm?keywords={encoded_kw}"
-                st.link_button("🛒 1688 搜同款 (已修复乱码)", search_1688, use_container_width=True)
+                    encoded_kw = urllib.parse.quote(kw)
+                st.link_button("🛒 1688 搜同款", f"https://s.1688.com/selloffer/offer_search.htm?keywords={encoded_kw}", use_container_width=True)
