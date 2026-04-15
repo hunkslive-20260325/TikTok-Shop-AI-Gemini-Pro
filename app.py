@@ -208,6 +208,7 @@ if st.button("🚀 开始 AI 智能选品引擎", type="primary", use_container_
                 # 1688 乱码修复逻辑
                 # 使用 utf-8 编码关键词。如果 1688 仍然显示乱码，尝试更换搜索入口
                 kw = ai_res['cn_name'] if ai_res['cn_name'] != "解析失败" else p.get('product_name')
-                encoded_kw = urllib.parse.quote(kw)
+                # encoded_kw = urllib.parse.quote(kw)
+                encoded_kw = urllib.parse.quote(kw.encode('gbk'))
                 search_1688 = f"https://s.1688.com/selloffer/offer_search.htm?keywords={encoded_kw}"
                 st.link_button("🛒 1688 搜同款 (已修复乱码)", search_1688, use_container_width=True)
